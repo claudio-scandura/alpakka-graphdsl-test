@@ -10,7 +10,7 @@ import akka.kafka.{ConsumerSettings, Subscriptions}
 import akka.stream.ActorAttributes.supervisionStrategy
 import akka.stream.Supervision.resumingDecider
 import akka.stream._
-import akka.stream.scaladsl.{Flow, GraphDSL, Keep, Sink, Unzip, Zip}
+import akka.stream.scaladsl.{Flow, GraphDSL, Keep, Sink, Source, Unzip, Zip}
 import akka.{Done, NotUsed}
 import net.manub.embeddedkafka.{EmbeddedKafka, EmbeddedKafkaConfig}
 import org.apache.kafka.clients.consumer.ConsumerConfig.AUTO_OFFSET_RESET_CONFIG
@@ -97,4 +97,47 @@ class UnzipZipSpec extends WordSpec
       }
     }
   }
+
+  "The stream graph" should {
+
+    "ignore error and keep processing coming elements" in {
+
+      implicit val sys = ActorSystem("Test-system")
+      implicit val mat = ActorMaterializer.create(ActorSystem("Test-system"))
+
+      val result = new AtomicReference[Boolean](false)
+
+      val failingFlow: Flow[String, Done, NotUsed] = Flow[String].map {
+        case "b" => throw new RuntimeException("Error!")
+        case "c" =>
+          result.set(true)
+          Done
+        case _ => Done
+      }
+
+      def buildFlow() =
+        Flow.fromGraph(GraphDSL.create() { implicit b =>
+          import GraphDSL.Implicits._
+
+          val unzip = b.add(Unzip[String, Int]())
+          val zip = b.add(Zip[Done, Int]())
+
+          unzip.out0.via(failingFlow) ~> zip.in0
+
+          unzip.out1 ~> zip.in1
+
+          FlowShape(unzip.in, zip.out)
+        }).map(_._2).withAttributes(supervisionStrategy(resumingDecider))
+
+
+      Source(List("a" -> 1, "b" -> 2, "c" -> 3))
+        .via(buildFlow())
+        .toMat(Sink.ignore)(Keep.right)
+        .run()
+        .futureValue
+
+      result.get() shouldBe true
+    }
+  }
+
 }
